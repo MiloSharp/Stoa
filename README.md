@@ -1,6 +1,6 @@
-# Stoa Engine v0.5
+# Stoa Engine v0.6
 
-A local-first autonomous simulation prototype with durable PostgreSQL snapshots/events, explicit actor goals, inspectable deterministic planning, approval-gated multi-provider AI proposals, conflict-aware concurrent activities, simulated time, timed movement, meaningful interrupts, scenario-defined worlds, named runs, private actor views, and a browser dashboard. Live model/provider calls are disabled by default.
+A local-first autonomous simulation prototype with durable PostgreSQL snapshots/events, explicit actor goals, inspectable deterministic planning, approval-gated multi-provider AI proposals, conflict-aware concurrent activities, simulated time, connected world topology, timed movement, meaningful interrupts, scenario-defined worlds, named runs, private actor views, and a browser dashboard. Live model/provider calls are disabled by default.
 
 ## Quick start
 
@@ -29,6 +29,22 @@ The dashboard keeps simulated time and its advance control in a sticky strip, ca
 By default, completing an activity automatically asks that same actor's subscription model for a new proposal. The request is skipped if the actor is busy, already thinking, already has a pending proposal, or is inside the bounded multi-cycle runner. Follow-up proposals still wait for approval and can be disabled from the dashboard.
 
 Scenario actors may include `goals`. Each goal has an `id`, `description`, `priority`, and ordered `steps`. A goal with `repeat: true` becomes an ongoing routine after higher-priority finite projects are complete. Steps may use the same location, duration, reads, writes, effects, outcome, and interrupt fields as manually scheduled activities. The deterministic planner moves actors where needed and chooses the highest-priority available goal.
+
+## World topology
+
+Locations may declare directed `exits`. Each exit names an adjacent destination and its positive integer travel duration. Movement is allowed only across a direct exit, takes the exit's duration regardless of a proposed duration, and changes the actor's location only when that travel completes. Activities must occur at the actor's current location, so they cannot bypass the topology. Both the deterministic and subscription-backed planners can target a more distant location; Stoa finds a route and schedules only the next connected step.
+
+```json
+{
+  "locations": [
+    { "name": "Agora", "exits": { "Archive": { "duration": 1 }, "South Garden": { "duration": 1 } } },
+    { "name": "Archive", "exits": { "Agora": { "duration": 1 } } },
+    { "name": "South Garden", "exits": { "Agora": { "duration": 1 } } }
+  ]
+}
+```
+
+Exits are one-way unless the reverse exit is also declared. For backward compatibility, a scenario with no `exits` field anywhere retains the earlier fully connected behavior with one-tick travel. As soon as any location declares `exits`, omitted exit lists are treated as empty.
 
 ## Safety boundary
 

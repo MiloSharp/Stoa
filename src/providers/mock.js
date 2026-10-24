@@ -1,3 +1,5 @@
+import { nextStepToward } from '../world.js';
+
 export class DeterministicMockProvider {
   constructor() { this.name = 'deterministic-mock'; this.live = false; }
   propose(state, actorId) {
@@ -11,11 +13,13 @@ export class DeterministicMockProvider {
       const step = steps.find((candidate) => goal.repeat || !completed.has(candidate.id));
       if (!step) continue;
       if (step.location && actor.location !== step.location) {
+        const destination = nextStepToward(state.locations, actor.location, step.location);
+        if (!destination) return null;
         return { goalId: goal.id, rationale: `${actorId} needs to reach ${step.location} before ${step.name}.`, command: {
-          type: 'move', actor: actorId, name: `go to ${step.location}`, destination: step.location,
-          duration: step.travelDuration ?? 1, reads: [`location:${actor.location}`], writes: [`actor:${actorId}:location`],
+          type: 'move', actor: actorId, name: destination === step.location ? `go to ${step.location}` : `go toward ${step.location} via ${destination}`, destination,
+          reads: [`location:${actor.location}`], writes: [`actor:${actorId}:location`],
           interruptSignals: ['danger', 'request'], goalId: goal.id, stepId: `move:${step.id}`,
-          outcome: `${actorId} arrived at ${step.location}.`, proposedBy: this.name
+          outcome: `${actorId} arrived at ${destination}.`, proposedBy: this.name
         } };
       }
       return { goalId: goal.id, rationale: `${actorId} chose “${step.name}” to advance the goal “${goal.description}”.`, command: {

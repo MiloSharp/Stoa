@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { findConflicts } from './conflicts.js';
+import { directExit, normalizeTopology, topologyError } from './world.js';
 
 const defaultGoals = {
   athena: [
@@ -19,7 +20,11 @@ const defaultActors = () => Object.fromEntries(['athena', 'minerva', 'pallas'].m
   id, status: 'idle', activityId: null, activity: 'idle', location: 'Agora', sinceAt: 0, untilAt: null,
   goals: structuredClone(defaultGoals[id]), currentGoal: null, lastDecision: null
 }]));
-const defaultLocations = () => ({ Agora: { name: 'Agora', description: 'The shared central space.' }, Archive: { name: 'Archive', description: 'Records and study materials.' }, 'South Garden': { name: 'South Garden', description: 'A cultivated outdoor area.' } });
+const defaultLocations = () => ({
+  Agora: { name: 'Agora', description: 'The shared central space.', exits: { Archive: { duration: 1 }, 'South Garden': { duration: 1 } } },
+  Archive: { name: 'Archive', description: 'Records and study materials.', exits: { Agora: { duration: 1 } } },
+  'South Garden': { name: 'South Garden', description: 'A cultivated outdoor area.', exits: { Agora: { duration: 1 } } }
+});
 const freshState = () => ({ clock: 0, version: 0, sequence: 0, paused: false, scenario: 'default', objects: {}, locations: defaultLocations(), actors: defaultActors(), activities: [], events: [], memories: [], journal: [], proposals: [], autonomy: { cycles: 0, decisions: [] } });
 
 export class StoaEngine {
@@ -30,6 +35,11 @@ export class StoaEngine {
     this.state = loaded.snapshot ?? freshState();
     this.state.actors ??= defaultActors();
     this.state.locations ??= defaultLocations();
+    const defaultWorld = defaultLocations();
+    if (this.state.scenario === 'default' && Object.keys(defaultWorld).every((name) => this.state.locations[name])) {
+      for (const [name, location] of Object.entries(defaultWorld)) this.state.locations[name].exits ??= structuredClone(location.exits);
+    }
+    this.state.locations = normalizeTopology(this.state.locations, { legacyComplete: true });
     this.state.journal ??= [];
     this.state.autonomy ??= { cycles: 0, decisions: [] };
     this.state.proposals ??= [];
@@ -49,7 +59,8 @@ export class StoaEngine {
       if (activity.targetActor && !activity.writes.includes(`actor:${activity.targetActor}:attention`)) activity.writes.push(`actor:${activity.targetActor}:attention`);
       this.state.actors[activity.actor] ??= { id: activity.actor, location: 'unspecified' };
       Object.assign(this.state.actors[activity.actor], { status: activity.status, activityId: activity.id, activity: activity.name,
-        location: activity.location ?? this.state.actors[activity.actor].location ?? 'unspecified', sinceAt: activity.startAt, untilAt: activity.status === 'active' ? activity.endAt : null });
+        location: activity.kind === 'movement' ? this.state.actors[activity.actor].location : activity.location ?? this.state.actors[activity.actor].location ?? 'unspecified',
+        sinceAt: activity.startAt, untilAt: activity.status === 'active' ? activity.endAt : null });
     }
     return this;
   }
@@ -90,20 +101,33 @@ export class StoaEngine {
     if (command.type === 'scenario.load') {
       if (draft.version !== 0 || draft.events.length) return { ok: false, reason: 'scenario can only be loaded into a new run' };
       if (!command.scenario || !Array.isArray(command.scenario.actors) || !Array.isArray(command.scenario.locations)) return { ok: false, reason: 'invalid scenario' };
-      events = [this.#event('scenario.loaded', { scenario: command.scenario })];
+      const rawLocations = Object.fromEntries(command.scenario.locations.map((location) => [location.name, location]));
+      const locations = normalizeTopology(rawLocations, { legacyComplete: true });
+      const invalidTopology = topologyError(locations);
+      if (invalidTopology) return { ok: false, reason: invalidTopology };
+      if (command.scenario.actors.some((actor) => actor.location && !locations[actor.location])) return { ok: false, reason: 'actor has unknown location' };
+      events = [this.#event('scenario.loaded', { scenario: { ...structuredClone(command.scenario), locations: Object.values(locations) } })];
     } else if (command.type === 'schedule' || command.type === 'move') {
-      const duration = Number(command.duration);
-      if (!command.actor || !command.name || !Number.isInteger(duration) || duration <= 0) return { ok: false, reason: 'invalid activity' };
+      if (!command.actor || !command.name || !draft.actors?.[command.actor]) return { ok: false, reason: 'invalid activity' };
       const destination = command.type === 'move' ? command.destination?.trim() : null;
       if (destination && !draft.locations[destination]) return { ok: false, reason: 'unknown destination' };
+      const origin = draft.actors[command.actor].location;
+      const activityLocation = command.type === 'move' ? origin : command.location?.trim() || origin;
+      if (!draft.locations[activityLocation]) return { ok: false, reason: 'unknown activity location' };
+      const exit = destination ? directExit(draft.locations, origin, destination) : null;
+      if (command.type === 'move' && origin === destination) return { ok: false, reason: 'actor is already at destination' };
+      if (command.type === 'move' && !exit) return { ok: false, reason: `no direct exit from ${origin} to ${destination || 'the requested destination'}` };
+      const duration = command.type === 'move' ? exit.duration : Number(command.duration);
+      if (!Number.isInteger(duration) || duration <= 0) return { ok: false, reason: 'invalid activity' };
       const targetActor = command.targetActor?.trim() || null;
       if (targetActor && (!draft.actors[targetActor] || targetActor === command.actor)) return { ok: false, reason: 'invalid interaction partner' };
-      if (targetActor && draft.actors[targetActor].location !== (command.location?.trim() || draft.actors?.[command.actor]?.location)) return { ok: false, reason: 'interaction partner is elsewhere' };
+      if (targetActor && draft.actors[targetActor].location !== activityLocation) return { ok: false, reason: 'interaction partner is elsewhere' };
+      if (command.type === 'schedule' && activityLocation !== origin) return { ok: false, reason: 'actor is not at activity location' };
       const reads = [...new Set(command.reads ?? [])];
       const writes = [...new Set([...(command.writes ?? []), `actor:${command.actor}:attention`, ...(targetActor ? [`actor:${targetActor}:attention`] : [])])];
       const activity = { id: command.id ?? randomUUID(), actor: command.actor, name: command.name,
         startAt: draft.clock, endAt: draft.clock + duration, reads, writes,
-        interruptSignals: [...new Set(command.interruptSignals ?? ['danger'])], location: command.location?.trim() || draft.actors?.[command.actor]?.location || 'unspecified',
+        interruptSignals: [...new Set(command.interruptSignals ?? ['danger'])], location: activityLocation,
         kind: command.type === 'move' ? 'movement' : 'activity', destination, startEffects: structuredClone(command.startEffects ?? {}), cancelEffects: structuredClone(command.cancelEffects ?? {}),
         goalId: command.goalId ?? null, stepId: command.stepId ?? null, proposedBy: command.proposedBy ?? 'user', targetActor,
         spokenText: targetActor ? command.spokenText?.trim()?.slice(0, 1000) || null : null,
@@ -166,7 +190,8 @@ export class StoaEngine {
       state.actors ??= defaultActors();
       state.actors[event.actor] ??= { id: event.actor, location: 'unspecified' };
       Object.assign(state.actors[event.actor], { status: 'active', activityId: event.activity.id, activity: event.activity.name,
-        location: event.activity.location, sinceAt: event.activity.startAt, untilAt: event.activity.endAt, currentGoal: event.activity.goalId });
+        location: event.activity.kind === 'movement' ? state.actors[event.actor].location : event.activity.location,
+        sinceAt: event.activity.startAt, untilAt: event.activity.endAt, currentGoal: event.activity.goalId });
       Object.assign(state.objects, event.activity.startEffects ?? {});
     }
     if (event.type === 'activity.completed') {

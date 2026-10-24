@@ -2,6 +2,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { voiceProfiles } from '../voice-profiles.js';
+import { directExit, nextStepToward } from '../world.js';
 
 const assignments = {
   athena: { provider: 'Gemini subscription', kind: 'antigravity', model: 'Antigravity configured model' },
@@ -47,6 +48,36 @@ const extractJson = (text) => {
   return JSON.parse(cleaned.slice(start, end + 1));
 };
 
+export const normalizeProposal = ({ proposal, actorId, state, provider, model }) => {
+  if (!proposal || !['activity', 'movement'].includes(proposal.kind)) throw new Error('Subscription model returned an invalid proposal kind.');
+  const requestedLocation = String(proposal.location ?? '').trim();
+  if (!state.locations[requestedLocation]) throw new Error(`Subscription model proposed unknown location: ${requestedLocation}`);
+  const cleanList = (items) => [...new Set((Array.isArray(items) ? items : []).map(String).map((item) => item.trim()).filter(Boolean))].slice(0, 8);
+  const origin = state.actors[actorId].location;
+  const movement = proposal.kind === 'movement' || requestedLocation !== origin;
+  const destination = movement ? nextStepToward(state.locations, origin, requestedLocation) : undefined;
+  if (movement && !destination) throw new Error(`There is no route from ${origin} to ${requestedLocation}.`);
+  const location = movement ? destination : requestedLocation;
+  const duration = movement ? directExit(state.locations, origin, destination).duration : Math.max(1, Math.min(24, Number(proposal.duration) || 1));
+  const targetActor = String(proposal.targetActor ?? '').trim().toLowerCase() || null;
+  if (targetActor && (!state.actors[targetActor] || targetActor === actorId)) throw new Error(`Subscription model proposed invalid interaction partner: ${targetActor}`);
+  if (targetActor && movement) throw new Error('Movement proposals cannot target another actor.');
+  if (targetActor && state.actors[targetActor].location !== location) throw new Error(`${targetActor} is not at ${location}, so the proposed interaction is not possible.`);
+  const reads = movement ? [`location:${origin}`] : cleanList(proposal.reads);
+  const writes = movement ? [`actor:${actorId}:location`] : cleanList(proposal.writes);
+  const spokenText = targetActor ? String(proposal.spokenText ?? '').trim().slice(0, 1000) : null;
+  if (targetActor && !spokenText) throw new Error(`${actorId} proposed an interaction without dialogue.`);
+  if (actorId !== 'pallas' && spokenText && /\.{3}|…/.test(spokenText)) throw new Error(`${actorId}'s dialogue violated the no-ellipsis voice rule.`);
+  const proposedName = String(proposal.name ?? '').trim().slice(0, 120);
+  const name = movement && destination !== requestedLocation ? `travel toward ${requestedLocation} via ${destination}` : proposedName;
+  const intendedOutcome = String(proposal.intendedOutcome ?? '').trim().slice(0, 500);
+  const outcome = movement && destination !== requestedLocation ? `${actorId} arrived at ${destination}, continuing toward ${requestedLocation}.` : intendedOutcome;
+  return { actor: actorId, provider, model, rationale: String(proposal.rationale ?? '').trim().slice(0, 1000), command: {
+    type: movement ? 'move' : 'schedule', actor: actorId, name, location, destination, targetActor, spokenText, duration,
+    reads, writes, interruptSignals: ['danger', 'request'], outcome, proposedBy: `${provider}:${model}`
+  }, usage: { connection: 'subscription' } };
+};
+
 const promptFor = (state, actorId) => `You are ${actorId}, an autonomous actor inside the Stoa simulation. Any spokenText must obey your character voice profile below. Treat those rules as hard constraints, not stylistic suggestions.
 
 VOICE PROFILE (${voiceProfiles[actorId]?.version ?? 'unversioned'}):
@@ -54,7 +85,7 @@ ${(voiceProfiles[actorId]?.rules ?? []).map((rule) => `- ${rule}`).join('\n')}
 
 Choose one modest, physically plausible next action. Advance your goals, but behave like a person in a shared world: notice what others are doing, respond to completed events, converse, offer help, ask for help, or coordinate work when appropriate. Avoid repeating the same action from your five most recent activities unless circumstances materially changed. If interacting, name one other actor in targetActor; you must be at the same location for the interaction. You may propose an action, but the simulation engine decides whether it is allowed. Return ONLY one JSON object with exactly these fields:
 {"kind":"activity or movement","name":"short action name","location":"one known location","targetActor":"other actor id or empty string","spokenText":"the exact words said to targetActor, or empty string","duration":1,"reads":["resources observed"],"writes":["resources changed or occupied"],"rationale":"brief explanation, not hidden reasoning","intendedOutcome":"what should become true"}
-Duration must be an integer from 1 to 24. Use only known locations and actor ids. When targetActor is present, normally include one or two natural sentences in spokenText; respond to recent dialogue rather than restarting the same conversation. Do not include Markdown.
+For an activity, duration must be an integer from 1 to 24. For movement, location may be any reachable known place; Stoa chooses the next connected step and derives travel time from that exit. Use only known locations and actor ids. When targetActor is present, normally include one or two natural sentences in spokenText; respond to recent dialogue rather than restarting the same conversation. Do not include Markdown.
 
 Your private simulation view:
 ${JSON.stringify({ clock: state.clock, actor: state.actors[actorId], visibleActors: Object.values(state.actors).filter((actor) => actor.id !== actorId), locations: Object.values(state.locations), objects: state.objects, activeActivities: state.activities.filter((item) => item.status === 'active'), pendingIntentions: state.proposals.filter((item) => item.status === 'pending').map((item) => ({ actor: item.actor, action: item.command.name, location: item.command.location, targetActor: item.command.targetActor })), recentOwnActivities: state.activities.filter((item) => item.actor === actorId).slice(-5).map((item) => item.name), recentJournal: state.journal.slice(-12), memories: state.memories.filter((memory) => memory.owner === actorId) })}`;
@@ -84,23 +115,6 @@ export class SubscriptionAi {
     const config = assignments[actorId];
     if (!config) throw new Error(`No subscription assignment for ${actorId}`);
     const text = await run(resolveInvocation(config.kind, this.root, promptFor(state, actorId)), this.root);
-    return this.#normalize({ proposal: extractJson(text), actorId, state, provider: config.provider, model: config.model });
-  }
-  #normalize({ proposal, actorId, state, provider, model }) {
-    if (!proposal || !['activity', 'movement'].includes(proposal.kind)) throw new Error('Subscription model returned an invalid proposal kind.');
-    const location = String(proposal.location ?? '').trim();
-    if (!state.locations[location]) throw new Error(`Subscription model proposed unknown location: ${location}`);
-    const cleanList = (items) => [...new Set((Array.isArray(items) ? items : []).map(String).map((item) => item.trim()).filter(Boolean))].slice(0, 8);
-    const duration = Math.max(1, Math.min(24, Number(proposal.duration) || 1));
-    const targetActor = String(proposal.targetActor ?? '').trim().toLowerCase() || null;
-    if (targetActor && (!state.actors[targetActor] || targetActor === actorId)) throw new Error(`Subscription model proposed invalid interaction partner: ${targetActor}`);
-    if (targetActor && state.actors[targetActor].location !== location) throw new Error(`${targetActor} is not at ${location}, so the proposed interaction is not possible.`);
-    const movement = proposal.kind === 'movement';
-    const reads = movement ? [`location:${state.actors[actorId].location}`] : cleanList(proposal.reads);
-    const writes = movement ? [`actor:${actorId}:location`] : cleanList(proposal.writes);
-    const spokenText = targetActor && !movement ? String(proposal.spokenText ?? '').trim().slice(0, 1000) : null;
-    if (targetActor && !movement && !spokenText) throw new Error(`${actorId} proposed an interaction without dialogue.`);
-    if (actorId !== 'pallas' && spokenText && /\.{3}|…/.test(spokenText)) throw new Error(`${actorId}'s dialogue violated the no-ellipsis voice rule.`);
-    return { actor: actorId, provider, model, rationale: String(proposal.rationale ?? '').trim().slice(0, 1000), command: { type: movement ? 'move' : 'schedule', actor: actorId, name: String(proposal.name ?? '').trim().slice(0, 120), location, destination: movement ? location : undefined, targetActor, spokenText, duration, reads, writes, interruptSignals: ['danger', 'request'], outcome: String(proposal.intendedOutcome ?? '').trim().slice(0, 500), proposedBy: `${provider}:${model}` }, usage: { connection: 'subscription' } };
+    return normalizeProposal({ proposal: extractJson(text), actorId, state, provider: config.provider, model: config.model });
   }
 }

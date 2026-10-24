@@ -33,9 +33,11 @@ test('simulated time completes activities deterministically', async () => {
 
 test('actor status records location and interrupt state', async () => {
   const engine = await make();
+  await engine.submit({ type: 'move', actor: 'pallas', name: 'walk to South Garden', destination: 'South Garden' });
+  await engine.submit({ type: 'advance', amount: 1 });
   await engine.submit({ type: 'schedule', actor: 'pallas', name: 'inspect seedlings', location: 'South Garden', duration: 5, writes: ['garden-log'], interruptSignals: ['request'] });
   assert.equal(engine.snapshot().actors.pallas.location, 'South Garden');
-  assert.equal(engine.snapshot().actors.pallas.untilAt, 5);
+  assert.equal(engine.snapshot().actors.pallas.untilAt, 6);
   await engine.submit({ type: 'interrupt', actor: 'pallas', signal: 'request', mode: 'pause' });
   assert.equal(engine.snapshot().actors.pallas.status, 'paused');
   assert.equal(engine.snapshot().actors.pallas.activity, 'inspect seedlings');
@@ -76,23 +78,54 @@ test('pause blocks mutation until resumed', async () => {
 
 test('movement consumes time and changes location only on completion', async () => {
   const engine = await make();
-  await engine.submit({ type: 'move', actor: 'athena', name: 'walk to Archive', destination: 'Archive', duration: 2 });
+  await engine.submit({ type: 'move', actor: 'athena', name: 'walk to Archive', destination: 'Archive', duration: 99 });
   assert.equal(engine.snapshot().actors.athena.location, 'Agora');
-  await engine.submit({ type: 'advance', amount: 2 });
+  assert.equal(engine.snapshot().activities[0].endAt - engine.snapshot().activities[0].startAt, 1);
+  await engine.submit({ type: 'advance', amount: 1 });
   assert.equal(engine.snapshot().actors.athena.location, 'Archive');
   assert.match(engine.snapshot().journal[0].text, /arrived at Archive/);
 });
 
+test('movement requires a direct exit even when a longer route exists', async () => {
+  const engine = await make();
+  await engine.submit({ type: 'move', actor: 'athena', name: 'walk to Archive', destination: 'Archive' });
+  await engine.submit({ type: 'advance', amount: 1 });
+  const result = await engine.submit({ type: 'move', actor: 'athena', name: 'walk to South Garden', destination: 'South Garden' });
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'no direct exit from Archive to South Garden');
+  assert.equal(engine.snapshot().actors.athena.location, 'Archive');
+});
+
 test('activity outcomes update world and paused work can resume', async () => {
   const engine = await make();
+  await engine.submit({ type: 'move', actor: 'pallas', name: 'walk to South Garden', destination: 'South Garden' });
+  await engine.submit({ type: 'advance', amount: 1 });
   await engine.submit({ type: 'schedule', actor: 'pallas', name: 'measure soil', location: 'South Garden', duration: 3,
     effects: { soil: 'measured' }, outcome: 'Pallas completed the soil survey.', interruptSignals: ['request'] });
   await engine.submit({ type: 'interrupt', actor: 'pallas', signal: 'request', mode: 'pause' });
-  const activityId = engine.snapshot().activities[0].id;
+  const activityId = engine.snapshot().activities.find((activity) => activity.name === 'measure soil').id;
   await engine.submit({ type: 'activity.resume', activityId });
   await engine.submit({ type: 'advance', amount: 3 });
   assert.equal(engine.snapshot().objects.soil, 'measured');
-  assert.equal(engine.snapshot().journal[0].text, 'Pallas completed the soil survey.');
+  assert.equal(engine.snapshot().journal.at(-1).text, 'Pallas completed the soil survey.');
+});
+
+test('activities cannot bypass the world topology', async () => {
+  const engine = await make();
+  const result = await engine.submit({ type: 'schedule', actor: 'athena', name: 'study remotely', location: 'Archive', duration: 1 });
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'actor is not at activity location');
+  assert.equal(engine.snapshot().actors.athena.location, 'Agora');
+});
+
+test('active movement remains at its origin after a restart', async () => {
+  const store = new MemoryStore();
+  const first = await make(store);
+  await first.submit({ type: 'move', actor: 'athena', name: 'walk to Archive', destination: 'Archive' });
+  const restarted = await make(store);
+  assert.equal(restarted.snapshot().actors.athena.location, 'Agora');
+  await restarted.submit({ type: 'advance', amount: 1 });
+  assert.equal(restarted.snapshot().actors.athena.location, 'Archive');
 });
 
 test('start effects reserve a resource immediately and completion effects release it', async () => {
@@ -113,6 +146,31 @@ test('scenario JSON defines actors, locations, and objects for a new run', async
     locations: [{ name: 'Studio', description: 'A quiet room' }], objects: { lamp: 'lit' } } });
   assert.equal(result.ok, true); assert.equal(engine.snapshot().actors.rowan.location, 'Studio');
   assert.equal(engine.snapshot().locations.Studio.description, 'A quiet room'); assert.equal(engine.snapshot().objects.lamp, 'lit');
+});
+
+test('scenario topology preserves directed exits and rejects unknown destinations', async () => {
+  const engine = await make();
+  const scenario = {
+    name: 'directed-world',
+    actors: [{ id: 'rowan', location: 'Hall' }],
+    locations: [
+      { name: 'Hall', exits: { Cellar: { duration: 3 } } },
+      { name: 'Cellar', exits: {} }
+    ]
+  };
+  const loaded = await engine.submit({ type: 'scenario.load', scenario });
+  assert.equal(loaded.ok, true);
+  assert.deepEqual(engine.snapshot().locations.Hall.exits, { Cellar: { duration: 3 } });
+  assert.deepEqual(engine.snapshot().locations.Cellar.exits, {});
+
+  const invalid = await make();
+  const rejected = await invalid.submit({ type: 'scenario.load', scenario: {
+    name: 'invalid-world',
+    actors: [{ id: 'rowan', location: 'Hall' }],
+    locations: [{ name: 'Hall', exits: { Missing: { duration: 1 } } }]
+  } });
+  assert.equal(rejected.ok, false);
+  assert.equal(rejected.reason, 'exit from Hall references unknown destination Missing');
 });
 
 test('AI proposals remain pending until explicitly resolved', async () => {
